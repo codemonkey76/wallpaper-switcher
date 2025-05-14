@@ -72,6 +72,14 @@ fn main() {
                 .arg("wallpaper")
                 .arg(format!("{},{}", m.name, wallpaper.display()))
                 .status();
+            let darkened_path = format!("/tmp/hyprlock/{}.png", m.name);
+            let _ = Command::new("magick")
+                .arg(wallpaper)
+                .args(["-blur", "0x10"])
+                .args(["-fill", "rgba(0,0,0,0.8)"])
+                .args(["-draw", "rectangle 0,0 10000,10000"])
+                .arg(&darkened_path)
+                .status();
         } else {
             println!("No suitable wallpaper found for monitor {}", m.name);
         }
