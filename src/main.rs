@@ -1,9 +1,20 @@
+mod blur;
+mod cache;
+mod classify;
+
+use blur::generate_blur_if_needed;
+use cache::{WallpaperMeta, load_metadata_cache, save_metadata_cache};
+use classify::classify_wallpapers;
+
+use blake3::hash;
+use rayon::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::env;
+use std::path::Path;
 use std::process::Command;
-use walkdir::WalkDir;
+use std::time::Instant;
 
 #[derive(Debug, Deserialize)]
 struct Monitor {
@@ -12,33 +23,61 @@ struct Monitor {
 }
 
 fn main() {
+    let total_start = Instant::now();
+
+    // Get monitor info
+    let start = Instant::now();
     let output = Command::new("hyprctl")
         .arg("monitors")
         .arg("-j")
         .output()
         .expect("Failed to run hyprctl");
+    println!("Time to run hyprctl: {:.2?}", start.elapsed());
 
     let json = String::from_utf8_lossy(&output.stdout);
     let monitors: Vec<Monitor> = serde_json::from_str(&json).expect("Failed to parse hyprctl JSON");
 
-    let (portrait_images, landscape_images) = get_wallpapers_by_orientation(&format!(
-        "{}/Pictures/Wallpapers",
-        std::env::var("HOME").unwrap()
-    ));
+    // Paths
+    let home = env::var("HOME").unwrap();
+    let wp_dir = format!("{}/Pictures/Wallpapers", home);
+    let meta_path = format!("{}/.cache/wallpaper_meta.json", home);
 
-    let landscape_state_path = format!(
-        "{}/.cache/hyprpaper_index_landscape",
-        std::env::var("HOME").unwrap()
-    );
-    let portrait_state_path = format!(
-        "{}/.cache/hyprpaper_index_portrait",
-        std::env::var("HOME").unwrap()
-    );
+    let landscape_index_path = format!("{}/.cache/hyprpaper_index_landscape", home);
+    let portrait_index_path = format!("{}/.cache/hyprpaper_index_portrait", home);
 
-    let mut landscape_index = load_index(&landscape_state_path);
-    let mut portrait_index = load_index(&portrait_state_path);
+    let mut landscape_index = cache::load_index(&landscape_index_path);
+    let mut portrait_index = cache::load_index(&portrait_index_path);
+
+    // Load metadata and scan files
+    let start = Instant::now();
+    let mut metadata: HashMap<String, WallpaperMeta> = load_metadata_cache(&meta_path);
+    println!("Time to load metadata: {:.2?}", start.elapsed());
+
+    let start = Instant::now();
+    let re = Regex::new(r"(?i)\.(jpe?g|png|webp|jxl)$").unwrap();
+    let (portrait_images, landscape_images) = classify_wallpapers(&wp_dir, &re, &mut metadata);
+    println!("Time to classify wallpapers: {:.2?}", start.elapsed());
+
+    portrait_images
+        .iter()
+        .chain(landscape_images.iter())
+        .collect::<Vec<_>>()
+        .par_iter()
+        .for_each(|path| {
+            let out_path = format!(
+                "/tmp/hyprlock-cache/{}.png",
+                blake3::hash(path.to_string_lossy().as_bytes())
+            );
+            generate_blur_if_needed(path, Path::new(&out_path));
+        });
+
+    let start = Instant::now();
+    save_metadata_cache(&meta_path, &metadata);
+    println!("Time to save metadata: {:.2?}", start.elapsed());
 
     for m in monitors {
+        println!("Processing monitor: {}", m.name);
+
         let orientation = if m.transform % 2 == 0 {
             "landscape"
         } else {
@@ -60,6 +99,7 @@ fn main() {
         };
 
         if let Some(wallpaper) = selected {
+            let preload_start = Instant::now();
             println!("Setting wallpaper for {}: {}", m.name, wallpaper.display());
 
             let _ = Command::new("hyprctl")
@@ -67,81 +107,30 @@ fn main() {
                 .arg("preload")
                 .arg(wallpaper)
                 .status();
+            println!("  Preload time: {:.2?}", preload_start.elapsed());
+
+            let set_start = Instant::now();
             let _ = Command::new("hyprctl")
                 .arg("hyprpaper")
                 .arg("wallpaper")
                 .arg(format!("{},{}", m.name, wallpaper.display()))
                 .status();
-            let darkened_path = format!("/tmp/hyprlock/{}.png", m.name);
-            let _ = Command::new("magick")
-                .arg(wallpaper)
-                .args(["-blur", "0x10"])
-                .args(["-fill", "rgba(0,0,0,0.8)"])
-                .args(["-draw", "rectangle 0,0 10000,10000"])
-                .arg(&darkened_path)
-                .status();
+            println!("  Set wallpaper time: {:.2?}", set_start.elapsed());
+
+            let blur_start = Instant::now();
+            let darkened_path = format!(
+                "/tmp/hyprlock-cache/{}.png",
+                hash(wallpaper.to_string_lossy().as_bytes())
+            );
+
+            generate_blur_if_needed(wallpaper, Path::new(&darkened_path));
+            println!("  Blur generation time: {:.2?}", blur_start.elapsed());
         } else {
             println!("No suitable wallpaper found for monitor {}", m.name);
         }
     }
 
-    save_index(&landscape_state_path, landscape_index);
-    save_index(&portrait_state_path, portrait_index);
-}
-
-fn get_image_orientation(path: &PathBuf) -> Option<&'static str> {
-    let output = Command::new("identify")
-        .arg("-format")
-        .arg("%w %h")
-        .arg(path)
-        .output()
-        .ok()?;
-
-    let out_str = String::from_utf8_lossy(&output.stdout);
-    let mut parts = out_str.split_whitespace();
-    let width: u32 = parts.next()?.parse().ok()?;
-    let height: u32 = parts.next()?.parse().ok()?;
-
-    Some(if width >= height {
-        "landscape"
-    } else {
-        "portrait"
-    })
-}
-
-fn get_wallpapers_by_orientation(dir: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let re = Regex::new(r"(?i)\.(jpe?g|png|webp|jxl)$").unwrap();
-    let mut portrait = Vec::new();
-    let mut landscape = Vec::new();
-
-    for entry in WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.into_path();
-        println!("Found file: {}", path.display());
-        if !re.is_match(path.to_string_lossy().as_ref()) {
-            continue;
-        }
-
-        match get_image_orientation(&path) {
-            Some("portrait") => portrait.push(path),
-            Some("landscape") => landscape.push(path),
-            _ => (),
-        }
-    }
-
-    (portrait, landscape)
-}
-
-fn load_index(path: &str) -> usize {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
-}
-
-fn save_index(path: &str, index: usize) {
-    let _ = fs::write(path, index.to_string());
+    cache::save_index(&landscape_index_path, landscape_index);
+    cache::save_index(&portrait_index_path, portrait_index);
+    println!("Total runtime: {:.2?}", total_start.elapsed());
 }
