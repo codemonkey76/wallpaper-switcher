@@ -1,6 +1,8 @@
 [package]
 name = "wallpaper-switcher"
-version = "0.1.0"
+description = "Hyprland wallpaper-switcher"
+license = "MIT"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
