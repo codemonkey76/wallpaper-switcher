@@ -12,6 +12,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
@@ -125,6 +126,10 @@ fn main() {
 
             generate_blur_if_needed(wallpaper, Path::new(&darkened_path));
             println!("  Blur generation time: {:.2?}", blur_start.elapsed());
+            let symlink_path = format!("/tmp/hyprlock/{}.png", m.name);
+            let _ = std::fs::create_dir_all("/tmp/hyprlock");
+            let _ = std::fs::remove_file(&symlink_path);
+            let _ = symlink(&darkened_path, &symlink_path);
         } else {
             println!("No suitable wallpaper found for monitor {}", m.name);
         }
